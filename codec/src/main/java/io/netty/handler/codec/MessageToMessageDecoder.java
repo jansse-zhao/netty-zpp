@@ -27,8 +27,8 @@ import java.util.List;
 
 /**
  * {@link ChannelInboundHandlerAdapter} which decodes from one message to an other message.
- *
- *
+ * <p>
+ * <p>
  * For example here is an implementation which decodes a {@link String} to an {@link Integer} which represent
  * the length of the {@link String}.
  *
@@ -43,79 +43,85 @@ import java.util.List;
  *         }
  *     }
  * </pre>
- *
+ * <p>
  * Be aware that you need to call {@link ReferenceCounted#retain()} on messages that are just passed through if they
  * are of type {@link ReferenceCounted}. This is needed as the {@link MessageToMessageDecoder} will call
  * {@link ReferenceCounted#release()} on decoded messages.
- *
  */
 public abstract class MessageToMessageDecoder<I> extends ChannelInboundHandlerAdapter {
 
-    private final TypeParameterMatcher matcher;
 
-    /**
-     * Create a new instance which will try to detect the types to match out of the type parameter of the class.
-     */
-    protected MessageToMessageDecoder() {
-        matcher = TypeParameterMatcher.find(this, MessageToMessageDecoder.class, "I");
-    }
+	/**
+	 * 二层解码器，主要用来解决字节数组到字符串的解码，
+	 * 它对应的还有一层解码器(解决粘包&半包问题)：{@link ByteToMessageDecoder}
+	 */
 
-    /**
-     * Create a new instance
-     *
-     * @param inboundMessageType    The type of messages to match and so decode
-     */
-    protected MessageToMessageDecoder(Class<? extends I> inboundMessageType) {
-        matcher = TypeParameterMatcher.get(inboundMessageType);
-    }
 
-    /**
-     * Returns {@code true} if the given message should be handled. If {@code false} it will be passed to the next
-     * {@link ChannelInboundHandler} in the {@link ChannelPipeline}.
-     */
-    public boolean acceptInboundMessage(Object msg) throws Exception {
-        return matcher.match(msg);
-    }
+	private final TypeParameterMatcher matcher;
 
-    @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        CodecOutputList out = CodecOutputList.newInstance();
-        try {
-            if (acceptInboundMessage(msg)) {
-                @SuppressWarnings("unchecked")
-                I cast = (I) msg;
-                try {
-                    decode(ctx, cast, out);
-                } finally {
-                    ReferenceCountUtil.release(cast);
-                }
-            } else {
-                out.add(msg);
-            }
-        } catch (DecoderException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new DecoderException(e);
-        } finally {
-            try {
-                int size = out.size();
-                for (int i = 0; i < size; i++) {
-                    ctx.fireChannelRead(out.getUnsafe(i));
-                }
-            } finally {
-                out.recycle();
-            }
-        }
-    }
+	/**
+	 * Create a new instance which will try to detect the types to match out of the type parameter of the class.
+	 */
+	protected MessageToMessageDecoder() {
+		matcher = TypeParameterMatcher.find(this, MessageToMessageDecoder.class, "I");
+	}
 
-    /**
-     * Decode from one message to an other. This method will be called for each written message that can be handled
-     * by this decoder.
-     *
-     * @param ctx           the {@link ChannelHandlerContext} which this {@link MessageToMessageDecoder} belongs to
-     * @param msg           the message to decode to an other one
-     * @param out           the {@link List} to which decoded messages should be added
-     * @throws Exception    is thrown if an error occurs
-     */
-    protected abstract void decode(ChannelHandlerContext ctx, I msg, List<Object> out) throws Exception;
+	/**
+	 * Create a new instance
+	 *
+	 * @param inboundMessageType The type of messages to match and so decode
+	 */
+	protected MessageToMessageDecoder(Class<? extends I> inboundMessageType) {
+		matcher = TypeParameterMatcher.get(inboundMessageType);
+	}
+
+	/**
+	 * Returns {@code true} if the given message should be handled. If {@code false} it will be passed to the next
+	 * {@link ChannelInboundHandler} in the {@link ChannelPipeline}.
+	 */
+	public boolean acceptInboundMessage(Object msg) throws Exception {
+		return matcher.match(msg);
+	}
+
+	@Override
+	public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+		CodecOutputList out = CodecOutputList.newInstance();
+		try {
+			if (acceptInboundMessage(msg)) {
+				@SuppressWarnings("unchecked")
+				I cast = (I) msg;
+				try {
+					decode(ctx, cast, out);
+				} finally {
+					ReferenceCountUtil.release(cast);
+				}
+			} else {
+				out.add(msg);
+			}
+		} catch (DecoderException e) {
+			throw e;
+		} catch (Exception e) {
+			throw new DecoderException(e);
+		} finally {
+			try {
+				int size = out.size();
+				for (int i = 0; i < size; i++) {
+					ctx.fireChannelRead(out.getUnsafe(i));
+				}
+			} finally {
+				out.recycle();
+			}
+		}
+	}
+
+	/**
+	 * Decode from one message to an other. This method will be called for each written message that can be handled
+	 * by this decoder.
+	 *
+	 * @param ctx the {@link ChannelHandlerContext} which this {@link MessageToMessageDecoder} belongs to
+	 * @param msg the message to decode to an other one
+	 * @param out the {@link List} to which decoded messages should be added
+	 * @throws Exception is thrown if an error occurs
+	 */
+	protected abstract void decode(ChannelHandlerContext ctx, I msg, List<Object> out) throws Exception;
 }

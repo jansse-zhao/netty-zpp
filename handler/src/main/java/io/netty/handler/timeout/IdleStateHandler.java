@@ -16,15 +16,8 @@
 package io.netty.handler.timeout;
 
 import io.netty.bootstrap.ServerBootstrap;
-import io.netty.channel.Channel;
+import io.netty.channel.*;
 import io.netty.channel.Channel.Unsafe;
-import io.netty.channel.ChannelDuplexHandler;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInitializer;
-import io.netty.channel.ChannelOutboundBuffer;
-import io.netty.channel.ChannelPromise;
 import io.netty.util.concurrent.Future;
 import io.netty.util.internal.ObjectUtil;
 
@@ -97,513 +90,523 @@ import java.util.concurrent.TimeUnit;
  * @see WriteTimeoutHandler
  */
 public class IdleStateHandler extends ChannelDuplexHandler {
-    private static final long MIN_TIMEOUT_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
-
-    // Not create a new ChannelFutureListener per write operation to reduce GC pressure.
-    private final ChannelFutureListener writeListener = new ChannelFutureListener() {
-        @Override
-        public void operationComplete(ChannelFuture future) throws Exception {
-            lastWriteTime = ticksInNanos();
-            firstWriterIdleEvent = firstAllIdleEvent = true;
-        }
-    };
-
-    private final boolean observeOutput;
-    private final long readerIdleTimeNanos;
-    private final long writerIdleTimeNanos;
-    private final long allIdleTimeNanos;
-
-    private Future<?> readerIdleTimeout;
-    private long lastReadTime;
-    private boolean firstReaderIdleEvent = true;
-
-    private Future<?> writerIdleTimeout;
-    private long lastWriteTime;
-    private boolean firstWriterIdleEvent = true;
-
-    private Future<?> allIdleTimeout;
-    private boolean firstAllIdleEvent = true;
-
-    private byte state;
-    private static final byte ST_INITIALIZED = 1;
-    private static final byte ST_DESTROYED = 2;
-
-    private boolean reading;
-
-    private long lastChangeCheckTimeStamp;
-    private int lastMessageHashCode;
-    private long lastPendingWriteBytes;
-    private long lastFlushProgress;
-
-    /**
-     * Creates a new instance firing {@link IdleStateEvent}s.
-     *
-     * @param readerIdleTimeSeconds
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#READER_IDLE}
-     *        will be triggered when no read was performed for the specified
-     *        period of time.  Specify {@code 0} to disable.
-     * @param writerIdleTimeSeconds
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#WRITER_IDLE}
-     *        will be triggered when no write was performed for the specified
-     *        period of time.  Specify {@code 0} to disable.
-     * @param allIdleTimeSeconds
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#ALL_IDLE}
-     *        will be triggered when neither read nor write was performed for
-     *        the specified period of time.  Specify {@code 0} to disable.
-     */
-    public IdleStateHandler(
-            int readerIdleTimeSeconds,
-            int writerIdleTimeSeconds,
-            int allIdleTimeSeconds) {
-
-        this(readerIdleTimeSeconds, writerIdleTimeSeconds, allIdleTimeSeconds,
-             TimeUnit.SECONDS);
-    }
-
-    /**
-     * @see #IdleStateHandler(boolean, long, long, long, TimeUnit)
-     */
-    public IdleStateHandler(
-            long readerIdleTime, long writerIdleTime, long allIdleTime,
-            TimeUnit unit) {
-        this(false, readerIdleTime, writerIdleTime, allIdleTime, unit);
-    }
-
-    /**
-     * Creates a new instance firing {@link IdleStateEvent}s.
-     *
-     * @param observeOutput
-     *        whether or not the consumption of {@code bytes} should be taken into
-     *        consideration when assessing write idleness. The default is {@code false}.
-     * @param readerIdleTime
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#READER_IDLE}
-     *        will be triggered when no read was performed for the specified
-     *        period of time.  Specify {@code 0} to disable.
-     * @param writerIdleTime
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#WRITER_IDLE}
-     *        will be triggered when no write was performed for the specified
-     *        period of time.  Specify {@code 0} to disable.
-     * @param allIdleTime
-     *        an {@link IdleStateEvent} whose state is {@link IdleState#ALL_IDLE}
-     *        will be triggered when neither read nor write was performed for
-     *        the specified period of time.  Specify {@code 0} to disable.
-     * @param unit
-     *        the {@link TimeUnit} of {@code readerIdleTime},
-     *        {@code writeIdleTime}, and {@code allIdleTime}
-     */
-    public IdleStateHandler(boolean observeOutput,
-            long readerIdleTime, long writerIdleTime, long allIdleTime,
-            TimeUnit unit) {
-        ObjectUtil.checkNotNull(unit, "unit");
-
-        this.observeOutput = observeOutput;
-
-        if (readerIdleTime <= 0) {
-            readerIdleTimeNanos = 0;
-        } else {
-            readerIdleTimeNanos = Math.max(unit.toNanos(readerIdleTime), MIN_TIMEOUT_NANOS);
-        }
-        if (writerIdleTime <= 0) {
-            writerIdleTimeNanos = 0;
-        } else {
-            writerIdleTimeNanos = Math.max(unit.toNanos(writerIdleTime), MIN_TIMEOUT_NANOS);
-        }
-        if (allIdleTime <= 0) {
-            allIdleTimeNanos = 0;
-        } else {
-            allIdleTimeNanos = Math.max(unit.toNanos(allIdleTime), MIN_TIMEOUT_NANOS);
-        }
-    }
-
-    /**
-     * Return the readerIdleTime that was given when instance this class in milliseconds.
-     *
-     */
-    public long getReaderIdleTimeInMillis() {
-        return TimeUnit.NANOSECONDS.toMillis(readerIdleTimeNanos);
-    }
-
-    /**
-     * Return the writerIdleTime that was given when instance this class in milliseconds.
-     *
-     */
-    public long getWriterIdleTimeInMillis() {
-        return TimeUnit.NANOSECONDS.toMillis(writerIdleTimeNanos);
-    }
-
-    /**
-     * Return the allIdleTime that was given when instance this class in milliseconds.
-     *
-     */
-    public long getAllIdleTimeInMillis() {
-        return TimeUnit.NANOSECONDS.toMillis(allIdleTimeNanos);
-    }
-
-    @Override
-    public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-        if (ctx.channel().isActive() && ctx.channel().isRegistered()) {
-            // channelActive() event has been fired already, which means this.channelActive() will
-            // not be invoked. We have to initialize here instead.
-            initialize(ctx);
-        } else {
-            // channelActive() event has not been fired yet.  this.channelActive() will be invoked
-            // and initialization will occur there.
-        }
-    }
-
-    @Override
-    public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
-        destroy();
-    }
-
-    @Override
-    public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
-        // Initialize early if channel is active already.
-        if (ctx.channel().isActive()) {
-            initialize(ctx);
-        }
-        super.channelRegistered(ctx);
-    }
-
-    @Override
-    public void channelActive(ChannelHandlerContext ctx) throws Exception {
-        // This method will be invoked only if this handler was added
-        // before channelActive() event is fired.  If a user adds this handler
-        // after the channelActive() event, initialize() will be called by beforeAdd().
-        initialize(ctx);
-        super.channelActive(ctx);
-    }
-
-    @Override
-    public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        destroy();
-        super.channelInactive(ctx);
-    }
-
-    @Override
-    public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-        if (readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
-            reading = true;
-            firstReaderIdleEvent = firstAllIdleEvent = true;
-        }
-        ctx.fireChannelRead(msg);
-    }
-
-    @Override
-    public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
-        if ((readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) && reading) {
-            lastReadTime = ticksInNanos();
-            reading = false;
-        }
-        ctx.fireChannelReadComplete();
-    }
-
-    @Override
-    public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
-        // Allow writing with void promise if handler is only configured for read timeout events.
-        if (writerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
-            ctx.write(msg, promise.unvoid()).addListener(writeListener);
-        } else {
-            ctx.write(msg, promise);
-        }
-    }
-
-    /**
-     * Reset the read timeout. As this handler is not thread-safe, this method <b>must</b> be called on the event loop.
-     */
-    public void resetReadTimeout() {
-        if (readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
-            lastReadTime = ticksInNanos();
-            reading = false;
-        }
-    }
-
-    /**
-     * Reset the write timeout. As this handler is not thread-safe, this method <b>must</b> be called on the event loop.
-     */
-    public void resetWriteTimeout() {
-        if (writerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
-            lastWriteTime = ticksInNanos();
-        }
-    }
-
-    private void initialize(ChannelHandlerContext ctx) {
-        // Avoid the case where destroy() is called before scheduling timeouts.
-        // See: https://github.com/netty/netty/issues/143
-        switch (state) {
-        case 1:
-        case 2:
-            return;
-        default:
-             break;
-        }
-
-        state = ST_INITIALIZED;
-        initOutputChanged(ctx);
-
-        lastReadTime = lastWriteTime = ticksInNanos();
-        if (readerIdleTimeNanos > 0) {
-            readerIdleTimeout = schedule(ctx, new ReaderIdleTimeoutTask(ctx),
-                    readerIdleTimeNanos, TimeUnit.NANOSECONDS);
-        }
-        if (writerIdleTimeNanos > 0) {
-            writerIdleTimeout = schedule(ctx, new WriterIdleTimeoutTask(ctx),
-                    writerIdleTimeNanos, TimeUnit.NANOSECONDS);
-        }
-        if (allIdleTimeNanos > 0) {
-            allIdleTimeout = schedule(ctx, new AllIdleTimeoutTask(ctx),
-                    allIdleTimeNanos, TimeUnit.NANOSECONDS);
-        }
-    }
-
-    /**
-     * This method is visible for testing!
-     */
-    long ticksInNanos() {
-        return System.nanoTime();
-    }
-
-    /**
-     * This method is visible for testing!
-     */
-    Future<?> schedule(ChannelHandlerContext ctx, Runnable task, long delay, TimeUnit unit) {
-        return ctx.executor().schedule(task, delay, unit);
-    }
-
-    private void destroy() {
-        state = ST_DESTROYED;
-
-        if (readerIdleTimeout != null) {
-            readerIdleTimeout.cancel(false);
-            readerIdleTimeout = null;
-        }
-        if (writerIdleTimeout != null) {
-            writerIdleTimeout.cancel(false);
-            writerIdleTimeout = null;
-        }
-        if (allIdleTimeout != null) {
-            allIdleTimeout.cancel(false);
-            allIdleTimeout = null;
-        }
-    }
-
-    /**
-     * Is called when an {@link IdleStateEvent} should be fired. This implementation calls
-     * {@link ChannelHandlerContext#fireUserEventTriggered(Object)}.
-     */
-    protected void channelIdle(ChannelHandlerContext ctx, IdleStateEvent evt) throws Exception {
-        ctx.fireUserEventTriggered(evt);
-    }
-
-    /**
-     * Returns a {@link IdleStateEvent}.
-     */
-    protected IdleStateEvent newIdleStateEvent(IdleState state, boolean first) {
-        switch (state) {
-            case ALL_IDLE:
-                return first ? IdleStateEvent.FIRST_ALL_IDLE_STATE_EVENT : IdleStateEvent.ALL_IDLE_STATE_EVENT;
-            case READER_IDLE:
-                return first ? IdleStateEvent.FIRST_READER_IDLE_STATE_EVENT : IdleStateEvent.READER_IDLE_STATE_EVENT;
-            case WRITER_IDLE:
-                return first ? IdleStateEvent.FIRST_WRITER_IDLE_STATE_EVENT : IdleStateEvent.WRITER_IDLE_STATE_EVENT;
-            default:
-                throw new IllegalArgumentException("Unhandled: state=" + state + ", first=" + first);
-        }
-    }
-
-    /**
-     * @see #hasOutputChanged(ChannelHandlerContext, boolean)
-     */
-    private void initOutputChanged(ChannelHandlerContext ctx) {
-        if (observeOutput) {
-            Channel channel = ctx.channel();
-            Unsafe unsafe = channel.unsafe();
-            ChannelOutboundBuffer buf = unsafe.outboundBuffer();
-
-            if (buf != null) {
-                lastMessageHashCode = System.identityHashCode(buf.current());
-                lastPendingWriteBytes = buf.totalPendingWriteBytes();
-                lastFlushProgress = buf.currentProgress();
-            }
-        }
-    }
-
-    /**
-     * Returns {@code true} if and only if the {@link IdleStateHandler} was constructed
-     * with {@link #observeOutput} enabled and there has been an observed change in the
-     * {@link ChannelOutboundBuffer} between two consecutive calls of this method.
-     *
-     * https://github.com/netty/netty/issues/6150
-     */
-    private boolean hasOutputChanged(ChannelHandlerContext ctx, boolean first) {
-        if (observeOutput) {
-
-            // We can take this shortcut if the ChannelPromises that got passed into write()
-            // appear to complete. It indicates "change" on message level and we simply assume
-            // that there's change happening on byte level. If the user doesn't observe channel
-            // writability events then they'll eventually OOME and there's clearly a different
-            // problem and idleness is least of their concerns.
-            if (lastChangeCheckTimeStamp != lastWriteTime) {
-                lastChangeCheckTimeStamp = lastWriteTime;
-
-                // But this applies only if it's the non-first call.
-                if (!first) {
-                    return true;
-                }
-            }
-
-            Channel channel = ctx.channel();
-            Unsafe unsafe = channel.unsafe();
-            ChannelOutboundBuffer buf = unsafe.outboundBuffer();
-
-            if (buf != null) {
-                int messageHashCode = System.identityHashCode(buf.current());
-                long pendingWriteBytes = buf.totalPendingWriteBytes();
-
-                if (messageHashCode != lastMessageHashCode || pendingWriteBytes != lastPendingWriteBytes) {
-                    lastMessageHashCode = messageHashCode;
-                    lastPendingWriteBytes = pendingWriteBytes;
-
-                    if (!first) {
-                        return true;
-                    }
-                }
-
-                long flushProgress = buf.currentProgress();
-                if (flushProgress != lastFlushProgress) {
-                    lastFlushProgress = flushProgress;
-                    return !first;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private abstract static class AbstractIdleTask implements Runnable {
-
-        private final ChannelHandlerContext ctx;
-
-        AbstractIdleTask(ChannelHandlerContext ctx) {
-            this.ctx = ctx;
-        }
-
-        @Override
-        public void run() {
-            if (!ctx.channel().isOpen()) {
-                return;
-            }
-
-            run(ctx);
-        }
-
-        protected abstract void run(ChannelHandlerContext ctx);
-    }
-
-    private final class ReaderIdleTimeoutTask extends AbstractIdleTask {
-
-        ReaderIdleTimeoutTask(ChannelHandlerContext ctx) {
-            super(ctx);
-        }
-
-        @Override
-        protected void run(ChannelHandlerContext ctx) {
-            long nextDelay = readerIdleTimeNanos;
-            if (!reading) {
-                nextDelay -= ticksInNanos() - lastReadTime;
-            }
-
-            if (nextDelay <= 0) {
-                // Reader is idle - set a new timeout and notify the callback.
-                readerIdleTimeout = schedule(ctx, this, readerIdleTimeNanos, TimeUnit.NANOSECONDS);
-
-                boolean first = firstReaderIdleEvent;
-                firstReaderIdleEvent = false;
-
-                try {
-                    IdleStateEvent event = newIdleStateEvent(IdleState.READER_IDLE, first);
-                    channelIdle(ctx, event);
-                } catch (Throwable t) {
-                    ctx.fireExceptionCaught(t);
-                }
-            } else {
-                // Read occurred before the timeout - set a new timeout with shorter delay.
-                readerIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
-            }
-        }
-    }
-
-    private final class WriterIdleTimeoutTask extends AbstractIdleTask {
-
-        WriterIdleTimeoutTask(ChannelHandlerContext ctx) {
-            super(ctx);
-        }
-
-        @Override
-        protected void run(ChannelHandlerContext ctx) {
-
-            long lastWriteTime = IdleStateHandler.this.lastWriteTime;
-            long nextDelay = writerIdleTimeNanos - (ticksInNanos() - lastWriteTime);
-            if (nextDelay <= 0) {
-                // Writer is idle - set a new timeout and notify the callback.
-                writerIdleTimeout = schedule(ctx, this, writerIdleTimeNanos, TimeUnit.NANOSECONDS);
-
-                boolean first = firstWriterIdleEvent;
-                firstWriterIdleEvent = false;
-
-                try {
-                    if (hasOutputChanged(ctx, first)) {
-                        return;
-                    }
-
-                    IdleStateEvent event = newIdleStateEvent(IdleState.WRITER_IDLE, first);
-                    channelIdle(ctx, event);
-                } catch (Throwable t) {
-                    ctx.fireExceptionCaught(t);
-                }
-            } else {
-                // Write occurred before the timeout - set a new timeout with shorter delay.
-                writerIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
-            }
-        }
-    }
-
-    private final class AllIdleTimeoutTask extends AbstractIdleTask {
-
-        AllIdleTimeoutTask(ChannelHandlerContext ctx) {
-            super(ctx);
-        }
-
-        @Override
-        protected void run(ChannelHandlerContext ctx) {
-
-            long nextDelay = allIdleTimeNanos;
-            if (!reading) {
-                nextDelay -= ticksInNanos() - Math.max(lastReadTime, lastWriteTime);
-            }
-            if (nextDelay <= 0) {
-                // Both reader and writer are idle - set a new timeout and
-                // notify the callback.
-                allIdleTimeout = schedule(ctx, this, allIdleTimeNanos, TimeUnit.NANOSECONDS);
-
-                boolean first = firstAllIdleEvent;
-                firstAllIdleEvent = false;
-
-                try {
-                    if (hasOutputChanged(ctx, first)) {
-                        return;
-                    }
-
-                    IdleStateEvent event = newIdleStateEvent(IdleState.ALL_IDLE, first);
-                    channelIdle(ctx, event);
-                } catch (Throwable t) {
-                    ctx.fireExceptionCaught(t);
-                }
-            } else {
-                // Either read or write occurred before the timeout - set a new
-                // timeout with shorter delay.
-                allIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
-            }
-        }
-    }
+
+	/**
+	 * netty实现【空闲】心跳检测类，用来检测与客户端是否还存在链接
+	 * <p>
+	 * Netty的空闲检测和Keepalive机制都是为了确保客户端和服务器之间的连接仍然有效，防止连接断开。但它们在实现方式和原理上有所不同。
+	 * <p>
+	 * Netty的空闲检测机制是一种自定义的、基于【应用层】的机制。它主要通过定时发送和接收特定的消息（心跳包）来检测连接是否仍然处于活动状态。
+	 * 具体来说，Netty提供了IdleStateHandler类来实现心跳检测。在初始化ChannelPipeline时，我们可以添加IdleStateHandler实例，并设置读、写超时时间。
+	 * 当在指定时间内没有读或写操作时，IdleStateHandler会触发相应的事件。然后，我们可以添加一个自定义的事件处理类来处理这些事件，当检测到空闲状态时，
+	 * 发送心跳检测信息或者断开连接。
+	 * <p>
+	 * 而Keepalive机制则是【TCP/IP协议栈】（准确说应该是TCP协议）提供的一种机制，它依赖于操作系统实现。当TCP连接建立后，如果一段时间内（通常是2小时）双方都没有数据交互，
+	 * 那么操作系统会自动发送一个探测帧（keepalive probe）来查看对方是否还在线。如果对方无响应，操作系统会多次发送探测帧（系统默认每75秒发送一次，一共发送9次），
+	 * 直到确定连接已经断开。这种机制无需应用程序干预，但缺点是默认的心跳时间可能较长，不够灵活。
+	 * <p>
+	 * 在Netty中，我们可以选择使用空闲检测机制或Keepalive机制，或者同时使用两者来确保连接的稳定性。具体选择哪种方式，需要根据应用的具体需求和网络环境来决定。
+	 * 例如，如果应用对连接的实时性要求较高，或者网络环境不稳定，可能需要使用更频繁的空闲检测；而如果应用主要处理长时间无交互的连接，或者对操作系统的默认心跳时间满意，
+	 * 那么可以选择使用Keepalive机制。
+	 */
+
+
+	private static final long MIN_TIMEOUT_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+
+	// Not create a new ChannelFutureListener per write operation to reduce GC pressure.
+	private final ChannelFutureListener writeListener = new ChannelFutureListener() {
+		@Override
+		public void operationComplete(ChannelFuture future) throws Exception {
+			lastWriteTime = ticksInNanos();
+			firstWriterIdleEvent = firstAllIdleEvent = true;
+		}
+	};
+
+	private final boolean observeOutput;
+	private final long readerIdleTimeNanos;
+	private final long writerIdleTimeNanos;
+	private final long allIdleTimeNanos;
+
+	private Future<?> readerIdleTimeout;
+	private long lastReadTime;
+	private boolean firstReaderIdleEvent = true;
+
+	private Future<?> writerIdleTimeout;
+	private long lastWriteTime;
+	private boolean firstWriterIdleEvent = true;
+
+	private Future<?> allIdleTimeout;
+	private boolean firstAllIdleEvent = true;
+
+	private byte state;
+	private static final byte ST_INITIALIZED = 1;
+	private static final byte ST_DESTROYED = 2;
+
+	private boolean reading;
+
+	private long lastChangeCheckTimeStamp;
+	private int lastMessageHashCode;
+	private long lastPendingWriteBytes;
+	private long lastFlushProgress;
+
+	/**
+	 * Creates a new instance firing {@link IdleStateEvent}s.
+	 *
+	 * @param readerIdleTimeSeconds an {@link IdleStateEvent} whose state is {@link IdleState#READER_IDLE}
+	 *                              will be triggered when no read was performed for the specified
+	 *                              period of time.  Specify {@code 0} to disable.
+	 * @param writerIdleTimeSeconds an {@link IdleStateEvent} whose state is {@link IdleState#WRITER_IDLE}
+	 *                              will be triggered when no write was performed for the specified
+	 *                              period of time.  Specify {@code 0} to disable.
+	 * @param allIdleTimeSeconds    an {@link IdleStateEvent} whose state is {@link IdleState#ALL_IDLE}
+	 *                              will be triggered when neither read nor write was performed for
+	 *                              the specified period of time.  Specify {@code 0} to disable.
+	 */
+	public IdleStateHandler(
+			int readerIdleTimeSeconds,
+			int writerIdleTimeSeconds,
+			int allIdleTimeSeconds) {
+
+		this(readerIdleTimeSeconds, writerIdleTimeSeconds, allIdleTimeSeconds,
+				TimeUnit.SECONDS);
+	}
+
+	/**
+	 * @see #IdleStateHandler(boolean, long, long, long, TimeUnit)
+	 */
+	public IdleStateHandler(
+			long readerIdleTime, long writerIdleTime, long allIdleTime,
+			TimeUnit unit) {
+		this(false, readerIdleTime, writerIdleTime, allIdleTime, unit);
+	}
+
+	/**
+	 * Creates a new instance firing {@link IdleStateEvent}s.
+	 *
+	 * @param observeOutput  whether or not the consumption of {@code bytes} should be taken into
+	 *                       consideration when assessing write idleness. The default is {@code false}.
+	 * @param readerIdleTime an {@link IdleStateEvent} whose state is {@link IdleState#READER_IDLE}
+	 *                       will be triggered when no read was performed for the specified
+	 *                       period of time.  Specify {@code 0} to disable.
+	 * @param writerIdleTime an {@link IdleStateEvent} whose state is {@link IdleState#WRITER_IDLE}
+	 *                       will be triggered when no write was performed for the specified
+	 *                       period of time.  Specify {@code 0} to disable.
+	 * @param allIdleTime    an {@link IdleStateEvent} whose state is {@link IdleState#ALL_IDLE}
+	 *                       will be triggered when neither read nor write was performed for
+	 *                       the specified period of time.  Specify {@code 0} to disable.
+	 * @param unit           the {@link TimeUnit} of {@code readerIdleTime},
+	 *                       {@code writeIdleTime}, and {@code allIdleTime}
+	 */
+	public IdleStateHandler(boolean observeOutput,
+	                        long readerIdleTime, long writerIdleTime, long allIdleTime,
+	                        TimeUnit unit) {
+		ObjectUtil.checkNotNull(unit, "unit");
+
+		this.observeOutput = observeOutput;
+
+		if (readerIdleTime <= 0) {
+			readerIdleTimeNanos = 0;
+		} else {
+			readerIdleTimeNanos = Math.max(unit.toNanos(readerIdleTime), MIN_TIMEOUT_NANOS);
+		}
+		if (writerIdleTime <= 0) {
+			writerIdleTimeNanos = 0;
+		} else {
+			writerIdleTimeNanos = Math.max(unit.toNanos(writerIdleTime), MIN_TIMEOUT_NANOS);
+		}
+		if (allIdleTime <= 0) {
+			allIdleTimeNanos = 0;
+		} else {
+			allIdleTimeNanos = Math.max(unit.toNanos(allIdleTime), MIN_TIMEOUT_NANOS);
+		}
+	}
+
+	/**
+	 * Return the readerIdleTime that was given when instance this class in milliseconds.
+	 */
+	public long getReaderIdleTimeInMillis() {
+		return TimeUnit.NANOSECONDS.toMillis(readerIdleTimeNanos);
+	}
+
+	/**
+	 * Return the writerIdleTime that was given when instance this class in milliseconds.
+	 */
+	public long getWriterIdleTimeInMillis() {
+		return TimeUnit.NANOSECONDS.toMillis(writerIdleTimeNanos);
+	}
+
+	/**
+	 * Return the allIdleTime that was given when instance this class in milliseconds.
+	 */
+	public long getAllIdleTimeInMillis() {
+		return TimeUnit.NANOSECONDS.toMillis(allIdleTimeNanos);
+	}
+
+	@Override
+	public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+		if (ctx.channel().isActive() && ctx.channel().isRegistered()) {
+			// channelActive() event has been fired already, which means this.channelActive() will
+			// not be invoked. We have to initialize here instead.
+			initialize(ctx);
+		} else {
+			// channelActive() event has not been fired yet.  this.channelActive() will be invoked
+			// and initialization will occur there.
+		}
+	}
+
+	@Override
+	public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+		destroy();
+	}
+
+	@Override
+	public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
+		// Initialize early if channel is active already.
+		if (ctx.channel().isActive()) {
+			initialize(ctx);
+		}
+		super.channelRegistered(ctx);
+	}
+
+	@Override
+	public void channelActive(ChannelHandlerContext ctx) throws Exception {
+		// This method will be invoked only if this handler was added
+		// before channelActive() event is fired.  If a user adds this handler
+		// after the channelActive() event, initialize() will be called by beforeAdd().
+		initialize(ctx);
+		super.channelActive(ctx);
+	}
+
+	@Override
+	public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+		destroy();
+		super.channelInactive(ctx);
+	}
+
+	@Override
+	public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+		if (readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
+			reading = true;
+			firstReaderIdleEvent = firstAllIdleEvent = true;
+		}
+		ctx.fireChannelRead(msg);
+	}
+
+	@Override
+	public void channelReadComplete(ChannelHandlerContext ctx) throws Exception {
+		if ((readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) && reading) {
+			lastReadTime = ticksInNanos();
+			reading = false;
+		}
+		ctx.fireChannelReadComplete();
+	}
+
+	@Override
+	public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception {
+		// Allow writing with void promise if handler is only configured for read timeout events.
+		if (writerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
+			ctx.write(msg, promise.unvoid()).addListener(writeListener);
+		} else {
+			ctx.write(msg, promise);
+		}
+	}
+
+	/**
+	 * Reset the read timeout. As this handler is not thread-safe, this method <b>must</b> be called on the event loop.
+	 */
+	public void resetReadTimeout() {
+		if (readerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
+			lastReadTime = ticksInNanos();
+			reading = false;
+		}
+	}
+
+	/**
+	 * Reset the write timeout. As this handler is not thread-safe, this method <b>must</b> be called on the event loop.
+	 */
+	public void resetWriteTimeout() {
+		if (writerIdleTimeNanos > 0 || allIdleTimeNanos > 0) {
+			lastWriteTime = ticksInNanos();
+		}
+	}
+
+	private void initialize(ChannelHandlerContext ctx) {
+		// Avoid the case where destroy() is called before scheduling timeouts.
+		// See: https://github.com/netty/netty/issues/143
+		switch (state) {
+			case 1:
+			case 2:
+				return;
+			default:
+				break;
+		}
+
+		state = ST_INITIALIZED;
+		initOutputChanged(ctx);
+
+		lastReadTime = lastWriteTime = ticksInNanos();
+		if (readerIdleTimeNanos > 0) {
+			readerIdleTimeout = schedule(ctx, new ReaderIdleTimeoutTask(ctx),
+					readerIdleTimeNanos, TimeUnit.NANOSECONDS);
+		}
+		if (writerIdleTimeNanos > 0) {
+			writerIdleTimeout = schedule(ctx, new WriterIdleTimeoutTask(ctx),
+					writerIdleTimeNanos, TimeUnit.NANOSECONDS);
+		}
+		if (allIdleTimeNanos > 0) {
+			allIdleTimeout = schedule(ctx, new AllIdleTimeoutTask(ctx),
+					allIdleTimeNanos, TimeUnit.NANOSECONDS);
+		}
+	}
+
+	/**
+	 * This method is visible for testing!
+	 */
+	long ticksInNanos() {
+		return System.nanoTime();
+	}
+
+	/**
+	 * This method is visible for testing!
+	 */
+	Future<?> schedule(ChannelHandlerContext ctx, Runnable task, long delay, TimeUnit unit) {
+		return ctx.executor().schedule(task, delay, unit);
+	}
+
+	private void destroy() {
+		state = ST_DESTROYED;
+
+		if (readerIdleTimeout != null) {
+			readerIdleTimeout.cancel(false);
+			readerIdleTimeout = null;
+		}
+		if (writerIdleTimeout != null) {
+			writerIdleTimeout.cancel(false);
+			writerIdleTimeout = null;
+		}
+		if (allIdleTimeout != null) {
+			allIdleTimeout.cancel(false);
+			allIdleTimeout = null;
+		}
+	}
+
+	/**
+	 * Is called when an {@link IdleStateEvent} should be fired. This implementation calls
+	 * {@link ChannelHandlerContext#fireUserEventTriggered(Object)}.
+	 */
+	protected void channelIdle(ChannelHandlerContext ctx, IdleStateEvent evt) throws Exception {
+		ctx.fireUserEventTriggered(evt);
+	}
+
+	/**
+	 * Returns a {@link IdleStateEvent}.
+	 */
+	protected IdleStateEvent newIdleStateEvent(IdleState state, boolean first) {
+		switch (state) {
+			case ALL_IDLE:
+				return first ? IdleStateEvent.FIRST_ALL_IDLE_STATE_EVENT : IdleStateEvent.ALL_IDLE_STATE_EVENT;
+			case READER_IDLE:
+				return first ? IdleStateEvent.FIRST_READER_IDLE_STATE_EVENT : IdleStateEvent.READER_IDLE_STATE_EVENT;
+			case WRITER_IDLE:
+				return first ? IdleStateEvent.FIRST_WRITER_IDLE_STATE_EVENT : IdleStateEvent.WRITER_IDLE_STATE_EVENT;
+			default:
+				throw new IllegalArgumentException("Unhandled: state=" + state + ", first=" + first);
+		}
+	}
+
+	/**
+	 * @see #hasOutputChanged(ChannelHandlerContext, boolean)
+	 */
+	private void initOutputChanged(ChannelHandlerContext ctx) {
+		if (observeOutput) {
+			Channel channel = ctx.channel();
+			Unsafe unsafe = channel.unsafe();
+			ChannelOutboundBuffer buf = unsafe.outboundBuffer();
+
+			if (buf != null) {
+				lastMessageHashCode = System.identityHashCode(buf.current());
+				lastPendingWriteBytes = buf.totalPendingWriteBytes();
+				lastFlushProgress = buf.currentProgress();
+			}
+		}
+	}
+
+	/**
+	 * Returns {@code true} if and only if the {@link IdleStateHandler} was constructed
+	 * with {@link #observeOutput} enabled and there has been an observed change in the
+	 * {@link ChannelOutboundBuffer} between two consecutive calls of this method.
+	 * <p>
+	 * https://github.com/netty/netty/issues/6150
+	 */
+	private boolean hasOutputChanged(ChannelHandlerContext ctx, boolean first) {
+		if (observeOutput) {
+
+			// We can take this shortcut if the ChannelPromises that got passed into write()
+			// appear to complete. It indicates "change" on message level and we simply assume
+			// that there's change happening on byte level. If the user doesn't observe channel
+			// writability events then they'll eventually OOME and there's clearly a different
+			// problem and idleness is least of their concerns.
+			if (lastChangeCheckTimeStamp != lastWriteTime) {
+				lastChangeCheckTimeStamp = lastWriteTime;
+
+				// But this applies only if it's the non-first call.
+				if (!first) {
+					return true;
+				}
+			}
+
+			Channel channel = ctx.channel();
+			Unsafe unsafe = channel.unsafe();
+			ChannelOutboundBuffer buf = unsafe.outboundBuffer();
+
+			if (buf != null) {
+				int messageHashCode = System.identityHashCode(buf.current());
+				long pendingWriteBytes = buf.totalPendingWriteBytes();
+
+				if (messageHashCode != lastMessageHashCode || pendingWriteBytes != lastPendingWriteBytes) {
+					lastMessageHashCode = messageHashCode;
+					lastPendingWriteBytes = pendingWriteBytes;
+
+					if (!first) {
+						return true;
+					}
+				}
+
+				long flushProgress = buf.currentProgress();
+				if (flushProgress != lastFlushProgress) {
+					lastFlushProgress = flushProgress;
+					return !first;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	private abstract static class AbstractIdleTask implements Runnable {
+
+		private final ChannelHandlerContext ctx;
+
+		AbstractIdleTask(ChannelHandlerContext ctx) {
+			this.ctx = ctx;
+		}
+
+		@Override
+		public void run() {
+			if (!ctx.channel().isOpen()) {
+				return;
+			}
+
+			run(ctx);
+		}
+
+		protected abstract void run(ChannelHandlerContext ctx);
+	}
+
+	private final class ReaderIdleTimeoutTask extends AbstractIdleTask {
+
+		ReaderIdleTimeoutTask(ChannelHandlerContext ctx) {
+			super(ctx);
+		}
+
+		@Override
+		protected void run(ChannelHandlerContext ctx) {
+			long nextDelay = readerIdleTimeNanos;
+			if (!reading) {
+				nextDelay -= ticksInNanos() - lastReadTime;
+			}
+
+			if (nextDelay <= 0) {
+				// Reader is idle - set a new timeout and notify the callback.
+				readerIdleTimeout = schedule(ctx, this, readerIdleTimeNanos, TimeUnit.NANOSECONDS);
+
+				boolean first = firstReaderIdleEvent;
+				firstReaderIdleEvent = false;
+
+				try {
+					IdleStateEvent event = newIdleStateEvent(IdleState.READER_IDLE, first);
+					channelIdle(ctx, event);
+				} catch (Throwable t) {
+					ctx.fireExceptionCaught(t);
+				}
+			} else {
+				// Read occurred before the timeout - set a new timeout with shorter delay.
+				readerIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
+			}
+		}
+	}
+
+	private final class WriterIdleTimeoutTask extends AbstractIdleTask {
+
+		WriterIdleTimeoutTask(ChannelHandlerContext ctx) {
+			super(ctx);
+		}
+
+		@Override
+		protected void run(ChannelHandlerContext ctx) {
+
+			long lastWriteTime = IdleStateHandler.this.lastWriteTime;
+			long nextDelay = writerIdleTimeNanos - (ticksInNanos() - lastWriteTime);
+			if (nextDelay <= 0) {
+				// Writer is idle - set a new timeout and notify the callback.
+				writerIdleTimeout = schedule(ctx, this, writerIdleTimeNanos, TimeUnit.NANOSECONDS);
+
+				boolean first = firstWriterIdleEvent;
+				firstWriterIdleEvent = false;
+
+				try {
+					if (hasOutputChanged(ctx, first)) {
+						return;
+					}
+
+					IdleStateEvent event = newIdleStateEvent(IdleState.WRITER_IDLE, first);
+					channelIdle(ctx, event);
+				} catch (Throwable t) {
+					ctx.fireExceptionCaught(t);
+				}
+			} else {
+				// Write occurred before the timeout - set a new timeout with shorter delay.
+				writerIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
+			}
+		}
+	}
+
+	private final class AllIdleTimeoutTask extends AbstractIdleTask {
+
+		AllIdleTimeoutTask(ChannelHandlerContext ctx) {
+			super(ctx);
+		}
+
+		@Override
+		protected void run(ChannelHandlerContext ctx) {
+
+			long nextDelay = allIdleTimeNanos;
+			if (!reading) {
+				nextDelay -= ticksInNanos() - Math.max(lastReadTime, lastWriteTime);
+			}
+			if (nextDelay <= 0) {
+				// Both reader and writer are idle - set a new timeout and
+				// notify the callback.
+				allIdleTimeout = schedule(ctx, this, allIdleTimeNanos, TimeUnit.NANOSECONDS);
+
+				boolean first = firstAllIdleEvent;
+				firstAllIdleEvent = false;
+
+				try {
+					if (hasOutputChanged(ctx, first)) {
+						return;
+					}
+
+					IdleStateEvent event = newIdleStateEvent(IdleState.ALL_IDLE, first);
+					channelIdle(ctx, event);
+				} catch (Throwable t) {
+					ctx.fireExceptionCaught(t);
+				}
+			} else {
+				// Either read or write occurred before the timeout - set a new
+				// timeout with shorter delay.
+				allIdleTimeout = schedule(ctx, this, nextDelay, TimeUnit.NANOSECONDS);
+			}
+		}
+	}
 }
